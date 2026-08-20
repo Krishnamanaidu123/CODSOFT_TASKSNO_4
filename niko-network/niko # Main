@@ -1,0 +1,1015 @@
+cat > niko << 'EOF'
+#!/usr/bin/env python3
+"""
+NIKO - Network Detection and Live Traffic Intelligence Tool
+Production-Ready Network Security Analysis Engine (Headless Mode)
+Version: 3.0.0
+Author: Security Engineering Team
+"""
+
+import asyncio
+import argparse
+import json
+import os
+import sys
+import signal
+import socket
+import time
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Set, Tuple, Any
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+import ipaddress
+import hashlib
+
+# Third-party imports
+try:
+    from scapy.all import AsyncSniffer, IP, TCP, UDP, ICMP, ARP, Ether, Raw
+    from scapy.layers.inet import IP
+    from scapy.packet import Packet
+    import aiohttp
+except ImportError as e:
+    print(f"[ERROR] Missing required dependency: {e}")
+    print("Install with: pip install scapy aiohttp")
+    sys.exit(1)
+
+# ============================================================================
+# CONSTANTS & CONFIGURATION
+# ============================================================================
+
+# ASCII Art Banner - NIKO Logo
+BANNER = r"""
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                                                                           ║
+║   ███╗   ██╗██╗██╗  ██╗ ██████╗                                         ║
+║   ████╗  ██║██║██║ ██╔╝██╔═══██╗                                        ║
+║   ██╔██╗ ██║██║█████╔╝ ██║   ██║                                        ║
+║   ██║╚██╗██║██║██╔═██╗ ██║   ██║                                        ║
+║   ██║ ╚████║██║██║  ██╗╚██████╔╝                                        ║
+║   ╚═╝  ╚═══╝╚═╝╚═╝  ╚═╝ ╚═════╝                                         ║
+║                                                                           ║
+║   ███╗   ██╗███████╗████████╗██╗    ██╗ ██████╗ ██████╗ ██╗  ██╗        ║
+║   ████╗  ██║██╔════╝╚══██╔══╝██║    ██║██╔═══██╗██╔══██╗██║ ██╔╝        ║
+║   ██╔██╗ ██║█████╗     ██║   ██║ █╗ ██║██║   ██║██████╔╝█████╔╝         ║
+║   ██║╚██╗██║██╔══╝     ██║   ██║███╗██║██║   ██║██╔══██╗██╔═██╗         ║
+║   ██║ ╚████║██║        ██║   ╚███╔███╔╝╚██████╔╝██║  ██║██║  ██╗        ║
+║   ╚═╝  ╚═══╝╚═╝        ╚═╝    ╚══╝╚══╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝        ║
+║                                                                           ║
+║   Network Intelligence & Knowledge Observation                           ║
+║   Advanced Traffic Analysis Suite v3.0 (Headless)                        ║
+║                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+"""
+
+# Alert Colors (ANSI)
+COLORS = {
+    "CRITICAL": "\033[91m",  # Red
+    "HIGH": "\033[93m",      # Yellow
+    "MEDIUM": "\033[94m",    # Blue
+    "LOW": "\033[92m",       # Green
+    "INFO": "\033[96m",      # Cyan
+    "RESET": "\033[0m"       # Reset
+}
+
+ALERT_ICONS = {
+    "CRITICAL": "🔴",
+    "HIGH": "🟠",
+    "MEDIUM": "🟡",
+    "LOW": "🔵",
+    "INFO": "ℹ️"
+}
+
+# Configuration
+MAX_FLOWS = 10000
+ALERT_HISTORY = 1000
+PORT_SCAN_THRESHOLD = 20
+ARP_ALERT_THRESHOLD = 5
+DATA_SPIKE_THRESHOLD = 150000
+SYN_FLOOD_THRESHOLD = 50
+ICMP_FLOOD_THRESHOLD = 30
+FLOW_TIMEOUT = 300
+CLEANUP_INTERVAL = 1000
+REPORT_INTERVAL = 60  # seconds
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+@dataclass
+class Flow:
+    """Network flow representation"""
+    src_ip: str
+    dst_ip: str
+    protocol: str
+    src_port: Optional[int] = None
+    dst_port: Optional[int] = None
+    bytes_sent: int = 0
+    packets_count: int = 0
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    src_os: str = "Unknown"
+    dst_country: str = "Unknown"
+    dst_hostname: str = "Unknown"
+    src_mac: str = ""
+    dst_mac: str = ""
+    threat_score: float = 0.0
+    anomalies: List[str] = field(default_factory=list)
+
+@dataclass
+class Alert:
+    """Security alert structure"""
+    timestamp: float
+    severity: str
+    category: str
+    message: str
+    source: str
+    destination: str
+    details: Dict[str, Any] = field(default_factory=dict)
+    alert_id: str = field(default_factory=lambda: hashlib.md5(str(time.time()).encode()).hexdigest()[:8])
+
+@dataclass
+class Host:
+    """Network host information"""
+    ip: str
+    mac: str = ""
+    os: str = "Unknown"
+    hostname: str = "Unknown"
+    country: str = "Unknown"
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    packets_sent: int = 0
+    packets_received: int = 0
+    bytes_sent: int = 0
+    bytes_received: int = 0
+    open_ports: Set[int] = field(default_factory=set)
+    threat_score: float = 0.0
+    alerts: List[str] = field(default_factory=list)
+    is_malicious: bool = False
+
+# ============================================================================
+# CORE ENGINE
+# ============================================================================
+
+class NetworkIntelligenceEngine:
+    """Core engine for traffic analysis and threat detection"""
+    
+    def __init__(self, monitored_subnet: Optional[str] = None, verbose: bool = False):
+        self.monitored_subnet = monitored_subnet
+        self.verbose = verbose
+        self._monitored_network = None
+        
+        if monitored_subnet:
+            try:
+                self._monitored_network = ipaddress.ip_network(monitored_subnet, strict=False)
+            except ValueError:
+                pass
+        
+        # Data stores
+        self.flows: Dict[str, Flow] = {}
+        self.hosts: Dict[str, Host] = {}
+        self.alerts: deque = deque(maxlen=ALERT_HISTORY)
+        
+        # Detection trackers
+        self.port_scan_tracker: Dict[str, Dict[int, float]] = defaultdict(dict)
+        self.syn_tracker: Dict[str, List[float]] = defaultdict(list)
+        self.icmp_tracker: Dict[str, List[float]] = defaultdict(list)
+        self.arp_cache: Dict[str, str] = {}
+        self.mac_ip_cache: Dict[str, str] = {}
+        self.arp_request_tracker: Dict[str, List[float]] = defaultdict(list)
+        
+        # Enrichment caches
+        self.os_fingerprints: Dict[str, str] = {}
+        self.geo_cache: Dict[str, str] = {}
+        self.dns_cache: Dict[str, str] = {}
+        
+        # Statistics
+        self.packet_count = 0
+        self.byte_count = 0
+        self.start_time = time.time()
+        self.packet_rate: deque = deque(maxlen=10)
+        self.alert_count = 0
+        self._running = True
+        self._lock = asyncio.Lock()
+        self._alert_cooldown: Dict[str, float] = {}
+        
+        # Setup logging
+        self._setup_logging()
+        
+    def _setup_logging(self) -> None:
+        """Configure logging"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('niko.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        self.logger = logging.getLogger("NIKO")
+        
+    def analyze_packet(self, packet: Packet) -> None:
+        """Process a single packet for analysis"""
+        if not self._running:
+            return
+
+        try:
+            self.packet_count += 1
+            current_time = time.time()
+            
+            # Update packet rate
+            self.packet_rate.append(current_time)
+            
+            # Process based on packet type
+            if IP in packet:
+                self._analyze_ip_packet(packet, current_time)
+            elif ARP in packet:
+                self._analyze_arp_packet(packet, current_time)
+                
+            # Cleanup old flows periodically
+            if self.packet_count % CLEANUP_INTERVAL == 0:
+                self._cleanup_flows()
+                
+        except Exception as e:
+            self.logger.error(f"Error analyzing packet: {e}")
+            
+    def _analyze_ip_packet(self, packet: Packet, current_time: float) -> None:
+        """Analyze IP packets"""
+        ip_layer = packet[IP]
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+        proto = ip_layer.proto
+        length = len(packet)
+        
+        self.byte_count += length
+        
+        # Update host information
+        self._update_host(src_ip, packet, is_src=True, length=length)
+        self._update_host(dst_ip, packet, is_src=False, length=length)
+        
+        # Determine protocol and ports
+        protocol = self._get_protocol_name(proto)
+        src_port = None
+        dst_port = None
+        
+        if TCP in packet:
+            tcp = packet[TCP]
+            src_port = tcp.sport
+            dst_port = tcp.dport
+            
+            # Passive OS fingerprinting
+            self._fingerprint_os(src_ip, tcp, ip_layer.ttl)
+            
+            # SYN flood detection
+            if tcp.flags & 0x02:
+                self._track_syn(src_ip, current_time)
+                
+        elif UDP in packet:
+            src_port = packet[UDP].sport
+            dst_port = packet[UDP].dport
+            
+        elif proto == 1:  # ICMP
+            self._track_icmp(src_ip, current_time)
+            
+        # Create or update flow
+        flow_key = self._generate_flow_key(src_ip, dst_ip, protocol, src_port, dst_port)
+        
+        if flow_key not in self.flows:
+            self.flows[flow_key] = Flow(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                protocol=protocol,
+                src_port=src_port,
+                dst_port=dst_port,
+                src_os=self.os_fingerprints.get(src_ip, "Unknown"),
+                bytes_sent=length,
+                packets_count=1,
+                first_seen=current_time,
+                last_seen=current_time,
+                src_mac=packet.src if hasattr(packet, 'src') else "",
+                dst_mac=packet.dst if hasattr(packet, 'dst') else ""
+            )
+            
+            # Async enrichment
+            asyncio.create_task(self._enrich_flow(flow_key))
+        else:
+            flow = self.flows[flow_key]
+            flow.bytes_sent += length
+            flow.packets_count += 1
+            flow.last_seen = current_time
+            if src_port:
+                flow.src_port = src_port
+            if dst_port:
+                flow.dst_port = dst_port
+                
+            # Update threat score
+            self._update_flow_threat_score(flow)
+        
+        # Detect threats
+        self._detect_threats(packet, src_ip, dst_ip, proto, current_time)
+        
+    def _analyze_arp_packet(self, packet: Packet, current_time: float) -> None:
+        """Analyze ARP packets for spoofing and storms"""
+        arp = packet[ARP]
+        ip = arp.psrc
+        mac = arp.hwsrc
+        
+        # Track ARP requests
+        if arp.op == 1:
+            self.arp_request_tracker[ip].append(current_time)
+            self.arp_request_tracker[ip] = [
+                ts for ts in self.arp_request_tracker[ip]
+                if current_time - ts < 60
+            ]
+            
+            # ARP storm detection
+            if len(self.arp_request_tracker[ip]) > ARP_ALERT_THRESHOLD:
+                self._add_alert(
+                    severity="HIGH",
+                    category="ARP_STORM",
+                    message=f"ARP storm detected from {ip}",
+                    source=ip,
+                    destination=arp.pdst,
+                    details={
+                        "requests": len(self.arp_request_tracker[ip]),
+                        "target": arp.pdst,
+                        "mac": mac
+                    }
+                )
+        
+        # ARP spoofing detection
+        if mac in self.mac_ip_cache:
+            if self.mac_ip_cache[mac] != ip:
+                self._add_alert(
+                    severity="CRITICAL",
+                    category="ARP_SPOOFING",
+                    message=f"ARP spoofing detected! MAC {mac} claims multiple IPs",
+                    source=ip,
+                    destination=self.mac_ip_cache[mac],
+                    details={
+                        "mac": mac,
+                        "old_ip": self.mac_ip_cache[mac],
+                        "new_ip": ip
+                    }
+                )
+        else:
+            self.mac_ip_cache[mac] = ip
+            
+        # Update host
+        if ip in self.hosts:
+            self.hosts[ip].mac = mac
+            self.hosts[ip].last_seen = current_time
+            
+    def _update_host(self, ip: str, packet: Packet, is_src: bool, length: int) -> None:
+        """Update host information"""
+        if ip not in self.hosts:
+            self.hosts[ip] = Host(ip=ip)
+            
+        host = self.hosts[ip]
+        host.last_seen = time.time()
+        
+        if is_src:
+            host.packets_sent += 1
+            host.bytes_sent += length
+        else:
+            host.packets_received += 1
+            host.bytes_received += length
+            
+        if hasattr(packet, 'src'):
+            host.mac = packet.src
+            
+        # Track open ports
+        if TCP in packet and is_src:
+            tcp = packet[TCP]
+            if tcp.flags & 0x02:
+                host.open_ports.add(tcp.dport)
+                
+    def _get_protocol_name(self, proto_num: int) -> str:
+        """Map protocol number to name"""
+        protocols = {
+            1: "ICMP", 6: "TCP", 17: "UDP", 2: "IGMP",
+            47: "GRE", 50: "ESP", 51: "AH", 89: "OSPF"
+        }
+        return protocols.get(proto_num, f"PROTO-{proto_num}")
+        
+    def _fingerprint_os(self, ip: str, tcp_layer: TCP, ttl: int) -> None:
+        """Passive OS fingerprinting"""
+        if ip in self.os_fingerprints:
+            return
+            
+        window_size = tcp_layer.window
+        
+        if ttl <= 64:
+            if window_size >= 65535:
+                self.os_fingerprints[ip] = "Linux"
+            elif 8192 <= window_size <= 16384:
+                self.os_fingerprints[ip] = "macOS/iOS"
+            else:
+                self.os_fingerprints[ip] = "Unix-like"
+        elif ttl <= 128:
+            if window_size >= 65535:
+                self.os_fingerprints[ip] = "Windows"
+            else:
+                self.os_fingerprints[ip] = "Windows (Legacy)"
+        else:
+            self.os_fingerprints[ip] = "Unknown"
+            
+        # Update host
+        if ip in self.hosts:
+            self.hosts[ip].os = self.os_fingerprints[ip]
+            
+    def _generate_flow_key(self, src_ip: str, dst_ip: str, protocol: str,
+                          src_port: Optional[int] = None,
+                          dst_port: Optional[int] = None) -> str:
+        """Generate unique flow key"""
+        if protocol in ["TCP", "UDP"] and src_port and dst_port:
+            return f"{src_ip}:{src_port}-{dst_ip}:{dst_port}:{protocol}"
+        return f"{src_ip}:{dst_ip}:{protocol}"
+        
+    async def _enrich_flow(self, flow_key: str) -> None:
+        """Async enrichment with DNS and GeoIP"""
+        flow = self.flows.get(flow_key)
+        if not flow:
+            return
+            
+        # DNS reverse lookup
+        if flow.dst_ip not in self.dns_cache:
+            try:
+                hostname = await asyncio.to_thread(
+                    socket.gethostbyaddr, flow.dst_ip
+                )
+                self.dns_cache[flow.dst_ip] = hostname[0]
+            except:
+                self.dns_cache[flow.dst_ip] = "Unknown"
+                
+        # GeoIP
+        if flow.dst_ip not in self.geo_cache:
+            self.geo_cache[flow.dst_ip] = self._mock_geoip(flow.dst_ip)
+            
+        flow.dst_country = self.geo_cache[flow.dst_ip]
+        flow.dst_hostname = self.dns_cache[flow.dst_ip]
+        
+        # Update host
+        if flow.dst_ip in self.hosts:
+            self.hosts[flow.dst_ip].country = flow.dst_country
+            self.hosts[flow.dst_ip].hostname = flow.dst_hostname
+            
+    def _mock_geoip(self, ip: str) -> str:
+        """Mock GeoIP lookup"""
+        private_ips = ["10.", "172.16.", "192.168.", "127.", "169.254."]
+        if any(ip.startswith(prefix) for prefix in private_ips):
+            return "Private"
+            
+        countries = ["US", "GB", "DE", "FR", "JP", "CN", "RU", "BR", "IN", "AU"]
+        return countries[abs(hash(ip)) % len(countries)]
+        
+    def _track_syn(self, ip: str, current_time: float) -> None:
+        """Track SYN packets"""
+        self.syn_tracker[ip].append(current_time)
+        self.syn_tracker[ip] = [ts for ts in self.syn_tracker[ip] if current_time - ts < 10]
+        
+        if len(self.syn_tracker[ip]) > SYN_FLOOD_THRESHOLD:
+            self._add_alert(
+                severity="HIGH",
+                category="SYN_FLOOD",
+                message=f"SYN flood detected from {ip}",
+                source=ip,
+                destination="Multiple",
+                details={"syn_count": len(self.syn_tracker[ip])}
+            )
+            
+    def _track_icmp(self, ip: str, current_time: float) -> None:
+        """Track ICMP packets"""
+        self.icmp_tracker[ip].append(current_time)
+        self.icmp_tracker[ip] = [ts for ts in self.icmp_tracker[ip] if current_time - ts < 10]
+        
+        if len(self.icmp_tracker[ip]) > ICMP_FLOOD_THRESHOLD:
+            self._add_alert(
+                severity="MEDIUM",
+                category="ICMP_FLOOD",
+                message=f"ICMP flood detected from {ip}",
+                source=ip,
+                destination="Multiple",
+                details={"icmp_count": len(self.icmp_tracker[ip])}
+            )
+            
+    def _detect_threats(self, packet: Packet, src_ip: str, dst_ip: str,
+                       proto: int, current_time: float) -> None:
+        """Multi-layered threat detection"""
+        
+        # 1. Port Scanning
+        if TCP in packet and packet[TCP].flags & 0x02:
+            dst_port = packet[TCP].dport
+            self.port_scan_tracker[src_ip][dst_port] = current_time
+            self.port_scan_tracker[src_ip] = {
+                port: ts for port, ts in self.port_scan_tracker[src_ip].items()
+                if current_time - ts < 10
+            }
+            
+            if len(self.port_scan_tracker[src_ip]) > PORT_SCAN_THRESHOLD:
+                self._add_alert(
+                    severity="HIGH",
+                    category="PORT_SCAN",
+                    message=f"Port scanning detected from {src_ip}",
+                    source=src_ip,
+                    destination="Multiple",
+                    details={
+                        "ports": list(self.port_scan_tracker[src_ip].keys()),
+                        "count": len(self.port_scan_tracker[src_ip])
+                    }
+                )
+
+        # 2. Data Spike
+        if hasattr(packet, 'len') and packet.len > DATA_SPIKE_THRESHOLD:
+            self._add_alert(
+                severity="MEDIUM",
+                category="DATA_SPIKE",
+                message=f"Large data packet from {src_ip} to {dst_ip}",
+                source=src_ip,
+                destination=dst_ip,
+                details={"packet_size": packet.len}
+            )
+
+        # 3. Unusual Protocol
+        if proto not in [1, 6, 17]:
+            self._add_alert(
+                severity="LOW",
+                category="UNUSUAL_PROTOCOL",
+                message=f"Unusual protocol {proto} traffic from {src_ip}",
+                source=src_ip,
+                destination=dst_ip,
+                details={"protocol": proto}
+            )
+
+        # 4. Suspicious Ports
+        suspicious_ports = {4444, 5555, 6666, 1337, 31337, 4443}
+        if TCP in packet:
+            if packet[TCP].dport in suspicious_ports or packet[TCP].sport in suspicious_ports:
+                self._add_alert(
+                    severity="HIGH",
+                    category="SUSPICIOUS_PORT",
+                    message=f"Suspicious port traffic detected",
+                    source=src_ip,
+                    destination=dst_ip,
+                    details={
+                        "src_port": packet[TCP].sport,
+                        "dst_port": packet[TCP].dport
+                    }
+                )
+
+        # 5. Malicious IP Communication
+        malicious_ips = {"1.2.3.4", "5.6.7.8", "9.10.11.12"}
+        if dst_ip in malicious_ips or src_ip in malicious_ips:
+            self._add_alert(
+                severity="CRITICAL",
+                category="MALICIOUS_IP",
+                message=f"Communication with known malicious IP",
+                source=src_ip,
+                destination=dst_ip,
+                details={"malicious_ip": dst_ip if dst_ip in malicious_ips else src_ip}
+            )
+
+    def _update_flow_threat_score(self, flow: Flow) -> None:
+        """Update threat score"""
+        score = 0.0
+        
+        if flow.bytes_sent > 10000000:
+            score += 3.0
+        if flow.packets_count > 1000:
+            score += 2.0
+        if flow.dst_port and flow.dst_port < 1024 and flow.dst_port not in {80, 443, 53, 22, 25}:
+            score += 1.0
+            
+        flow.threat_score = min(score, 10.0)
+        
+    def _add_alert(self, severity: str, category: str, message: str,
+                  source: str, destination: str, details: Dict[str, Any]) -> None:
+        """Add alert with cooldown"""
+        current_time = time.time()
+        
+        # Cooldown check
+        alert_key = f"{severity}:{category}:{source}"
+        if alert_key in self._alert_cooldown:
+            if current_time - self._alert_cooldown[alert_key] < 60:
+                return
+                
+        alert = Alert(
+            timestamp=current_time,
+            severity=severity,
+            category=category,
+            message=message,
+            source=source,
+            destination=destination,
+            details=details
+        )
+        
+        self.alerts.append(alert)
+        self.alert_count += 1
+        self._alert_cooldown[alert_key] = current_time
+        
+        # Update host
+        if source in self.hosts:
+            self.hosts[source].alerts.append(alert.alert_id)
+        
+        # Print alert with color
+        color = COLORS.get(severity, COLORS["RESET"])
+        icon = ALERT_ICONS.get(severity, "⚠️")
+        print(f"{color}{icon} [{severity}] {message} (Source: {source}){COLORS['RESET']}")
+            
+    def _cleanup_flows(self) -> None:
+        """Remove stale flows"""
+        current_time = time.time()
+        stale_keys = [
+            key for key, flow in self.flows.items()
+            if current_time - flow.last_seen > FLOW_TIMEOUT
+        ]
+        for key in stale_keys:
+            del self.flows[key]
+            
+        # Cleanup stale hosts
+        stale_hosts = [
+            ip for ip, host in self.hosts.items()
+            if current_time - host.last_seen > FLOW_TIMEOUT
+        ]
+        for ip in stale_hosts:
+            del self.hosts[ip]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics"""
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+        pps = len(self.packet_rate) / 10 if len(self.packet_rate) > 0 else 0
+        
+        return {
+            "uptime": elapsed,
+            "packets": self.packet_count,
+            "bytes": self.byte_count,
+            "packets_per_sec": pps,
+            "active_hosts": len(self.hosts),
+            "active_flows": len(self.flows),
+            "alerts": self.alert_count,
+            "critical_alerts": len([a for a in self.alerts if a.severity == "CRITICAL"]),
+            "high_alerts": len([a for a in self.alerts if a.severity == "HIGH"])
+        }
+        
+    def get_flows(self, limit: int = 100) -> List[Flow]:
+        """Get current flows sorted by activity"""
+        return sorted(
+            self.flows.values(),
+            key=lambda f: f.packets_count,
+            reverse=True
+        )[:limit]
+        
+    def get_alerts(self) -> List[Alert]:
+        """Get recent alerts"""
+        return list(self.alerts)
+        
+    def get_hosts(self) -> Dict[str, Host]:
+        """Get all tracked hosts"""
+        return self.hosts
+        
+    def get_threat_summary(self) -> Dict[str, Any]:
+        """Get threat intelligence summary"""
+        summary = {
+            "total_alerts": self.alert_count,
+            "by_severity": defaultdict(int),
+            "by_category": defaultdict(int),
+            "top_attackers": [],
+            "malicious_hosts": []
+        }
+        
+        # Count by severity
+        for alert in self.alerts:
+            summary["by_severity"][alert.severity] += 1
+            summary["by_category"][alert.category] += 1
+            
+        # Top attackers
+        attacker_counts = defaultdict(int)
+        for alert in self.alerts:
+            attacker_counts[alert.source] += 1
+            
+        summary["top_attackers"] = sorted(
+            [(ip, count) for ip, count in attacker_counts.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]
+        
+        # Malicious hosts
+        summary["malicious_hosts"] = [
+            ip for ip, host in self.hosts.items()
+            if host.is_malicious or host.threat_score >= 7.0
+        ]
+        
+        return summary
+        
+    def print_flows(self, limit: int = 20) -> None:
+        """Print current flows in table format"""
+        flows = self.get_flows(limit)
+        
+        if not flows:
+            print("\n[No active flows]")
+            return
+            
+        # Print header
+        print("\n" + "=" * 100)
+        print(f"{'Source':<20} {'OS':<12} {'Destination':<20} {'Country':<10} {'Proto':<6} {'Pkts':<8} {'Bytes':<12}")
+        print("-" * 100)
+        
+        # Print flows
+        for flow in flows:
+            print(f"{flow.src_ip:<20} {flow.src_os:<12} {flow.dst_ip:<20} {flow.dst_country:<10} "
+                  f"{flow.protocol:<6} {flow.packets_count:<8} {flow.bytes_sent:<12,}")
+        print("=" * 100 + "\n")
+        
+    def print_alerts(self, limit: int = 10) -> None:
+        """Print recent alerts"""
+        alerts = self.get_alerts()[-limit:]
+        
+        if not alerts:
+            return
+            
+        print("\n" + "=" * 80)
+        print("Recent Alerts:")
+        print("-" * 80)
+        
+        for alert in reversed(alerts):
+            time_str = datetime.fromtimestamp(alert.timestamp).strftime("%H:%M:%S")
+            color = COLORS.get(alert.severity, COLORS["RESET"])
+            icon = ALERT_ICONS.get(alert.severity, "⚠️")
+            print(f"{color}{icon} [{alert.severity}] {time_str} - {alert.message} (Source: {alert.source}){COLORS['RESET']}")
+        print("=" * 80 + "\n")
+        
+    def export_report(self, filename: Optional[str] = None) -> str:
+        """Export session report to JSON"""
+        if not filename:
+            os.makedirs("reports", exist_ok=True)
+            filename = f"reports/niko_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "monitored_subnet": self.monitored_subnet,
+            "stats": self.get_stats(),
+            "threat_summary": self.get_threat_summary(),
+            "flows": [
+                {
+                    "src_ip": f.src_ip,
+                    "src_os": f.src_os,
+                    "dst_ip": f.dst_ip,
+                    "dst_country": f.dst_country,
+                    "dst_hostname": f.dst_hostname,
+                    "protocol": f.protocol,
+                    "packets": f.packets_count,
+                    "bytes": f.bytes_sent,
+                    "threat_score": f.threat_score,
+                    "anomalies": f.anomalies
+                }
+                for f in self.get_flows(limit=1000)
+            ],
+            "alerts": [
+                {
+                    "timestamp": datetime.fromtimestamp(a.timestamp).isoformat(),
+                    "severity": a.severity,
+                    "category": a.category,
+                    "message": a.message,
+                    "source": a.source,
+                    "destination": a.destination,
+                    "details": a.details,
+                    "alert_id": a.alert_id
+                }
+                for a in self.get_alerts()
+            ],
+            "hosts": [
+                {
+                    "ip": h.ip,
+                    "os": h.os,
+                    "mac": h.mac,
+                    "hostname": h.hostname,
+                    "country": h.country,
+                    "packets_sent": h.packets_sent,
+                    "packets_received": h.packets_received,
+                    "bytes_sent": h.bytes_sent,
+                    "bytes_received": h.bytes_received,
+                    "open_ports": list(h.open_ports),
+                    "threat_score": h.threat_score,
+                    "is_malicious": h.is_malicious,
+                    "alert_count": len(h.alerts)
+                }
+                for h in self.hosts.values()
+            ]
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(report, f, indent=2)
+            
+        self.logger.info(f"Report exported to {filename}")
+        return filename
+        
+    def print_stats(self) -> None:
+        """Print current statistics"""
+        stats = self.get_stats()
+        print("\n" + "=" * 60)
+        print("NIKO Statistics")
+        print("-" * 60)
+        print(f"Uptime:           {stats['uptime']:.0f}s")
+        print(f"Packets:          {stats['packets']:,}")
+        print(f"Bytes:            {stats['bytes']:,}")
+        print(f"Packets/sec:      {stats['packets_per_sec']:.1f}")
+        print(f"Active Hosts:     {stats['active_hosts']}")
+        print(f"Active Flows:     {stats['active_flows']}")
+        print(f"Total Alerts:     {stats['alerts']}")
+        print(f"Critical Alerts:  {stats['critical_alerts']}")
+        print(f"High Alerts:      {stats['high_alerts']}")
+        print("=" * 60 + "\n")
+        
+    def stop(self) -> None:
+        """Stop the engine"""
+        self._running = False
+        self.logger.info("Engine stopped")
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+class NIKOHeadless:
+    """Headless NIKO application for production deployment"""
+    
+    def __init__(self, interface: str, monitored_subnet: Optional[str] = None, 
+                 verbose: bool = False, report_interval: int = REPORT_INTERVAL):
+        self.interface = interface
+        self.monitored_subnet = monitored_subnet
+        self.verbose = verbose
+        self.report_interval = report_interval
+        self.engine = NetworkIntelligenceEngine(monitored_subnet, verbose)
+        self.sniffer: Optional[AsyncSniffer] = None
+        self._running = True
+        self._last_report_time = time.time()
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+    def _signal_handler(self, signum, frame) -> None:
+        """Handle termination signals"""
+        self._running = False
+        print("\n[!] Shutdown signal received")
+        
+    async def run(self) -> None:
+        """Main execution loop"""
+        # Print NIKO Logo
+        print(BANNER)
+        print(f"[+] NIKO Initializing...")
+        print(f"[+] Interface: {self.interface}")
+        if self.monitored_subnet:
+            print(f"[+] Monitored Subnet: {self.monitored_subnet}")
+        print("[+] Starting packet capture...\n")
+        
+        # Start packet sniffer
+        self.sniffer = AsyncSniffer(
+            iface=self.interface,
+            prn=self.engine.analyze_packet,
+            store=False
+        )
+        self.sniffer.start()
+        print("[+] Packet capture started\n")
+        
+        # Main monitoring loop
+        while self._running:
+            await asyncio.sleep(1)
+            
+            current_time = time.time()
+            
+            # Print periodic report
+            if current_time - self._last_report_time >= self.report_interval:
+                self._last_report_time = current_time
+                self._print_report()
+                
+        # Cleanup
+        await self._cleanup()
+        
+    def _print_report(self) -> None:
+        """Print periodic report"""
+        print("\n" + "=" * 80)
+        print(f"NIKO Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("-" * 80)
+        
+        # Stats
+        stats = self.engine.get_stats()
+        print(f"📊 Packets: {stats['packets']:,} | "
+              f"Rate: {stats['packets_per_sec']:.1f}/s | "
+              f"Flows: {stats['active_flows']} | "
+              f"Hosts: {stats['active_hosts']}")
+        
+        # Alerts
+        print(f"🚨 Alerts: {stats['alerts']} "
+              f"(🔴 Critical: {stats['critical_alerts']}, "
+              f"🟠 High: {stats['high_alerts']})")
+        
+        # Top flows
+        flows = self.engine.get_flows(limit=5)
+        if flows:
+            print("\n📡 Top Flows:")
+            for i, flow in enumerate(flows[:5], 1):
+                print(f"  {i}. {flow.src_ip} -> {flow.dst_ip} "
+                      f"({flow.protocol}) [{flow.packets_count} pkts, "
+                      f"{flow.bytes_sent:,} bytes]")
+        
+        # Recent alerts
+        alerts = self.engine.get_alerts()[-3:]
+        if alerts:
+            print("\n⚠️ Recent Alerts:")
+            for alert in alerts:
+                color = COLORS.get(alert.severity, COLORS["RESET"])
+                icon = ALERT_ICONS.get(alert.severity, "⚠️")
+                print(f"  {color}{icon} [{alert.severity}] {alert.message}{COLORS['RESET']}")
+        
+        print("=" * 80)
+        
+    async def _cleanup(self) -> None:
+        """Graceful cleanup"""
+        print("\n[+] Stopping packet capture...")
+        if self.sniffer:
+            self.sniffer.stop()
+            
+        self.engine.stop()
+        
+        # Print final stats
+        self.engine.print_stats()
+        self.engine.print_flows(limit=10)
+        self.engine.print_alerts(limit=10)
+        
+        # Export final report
+        filename = self.engine.export_report()
+        print(f"[+] Final report saved to {filename}")
+        print("[+] NIKO shutdown complete")
+
+def check_privileges() -> None:
+    """Check if running with sufficient privileges"""
+    if os.geteuid() != 0:
+        print("[ERROR] NIKO requires root/sudo privileges for packet capture.")
+        print("Please run with: sudo python3 niko.py")
+        sys.exit(1)
+        
+async def main() -> None:
+    """Entry point"""
+    parser = argparse.ArgumentParser(
+        description="NIKO - Advanced Network Detection Engine (Headless)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sudo python3 niko.py --interface eth0
+  sudo python3 niko.py --interface wlan0 --monitored-subnet 192.168.1.0/24
+  sudo python3 niko.py --interface eth0 --report-interval 30 -v
+        """
+    )
+    parser.add_argument(
+        "-i", "--interface",
+        required=True,
+        help="Network interface to capture on (e.g., eth0, wlan0)"
+    )
+    parser.add_argument(
+        "-s", "--monitored-subnet",
+        help="Subnet to monitor for anomalies (e.g., 192.168.1.0/24)"
+    )
+    parser.add_argument(
+        "-r", "--report-interval",
+        type=int,
+        default=REPORT_INTERVAL,
+        help=f"Report interval in seconds (default: {REPORT_INTERVAL})"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output"
+    )
+    
+    args = parser.parse_args()
+    
+    # Check privileges
+    check_privileges()
+    
+    # Run NIKO
+    niko = NIKOHeadless(
+        args.interface, 
+        args.monitored_subnet, 
+        args.verbose,
+        args.report_interval
+    )
+    
+    try:
+        await niko.run()
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user")
+    except Exception as e:
+        print(f"[ERROR] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+        
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[!] NIKO terminated.")
+        sys.exit(0)
+EOF
