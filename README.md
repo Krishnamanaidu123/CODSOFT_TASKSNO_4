@@ -51,13 +51,48 @@
         sudo niko --interface wlan0 -v
 
 
-# 🧪 Testing
+## 🧪 Testing
     bash
        ./test_niko.sh
 
-# 📊 Reports
-All session reports are saved as JSON in the reports/ directory.
 
-📝 License
+##  📊 Reports
+ All session reports are saved as JSON in the reports/ directory.
+
+
+## 🚀 How to Push to GitHub
+  After creating all these files in a local folder:
+
+    bash
+      cd niko-network
+      git init
+      git add .
+      git commit -m "Initial commit: NIKO NETWORK v3.0.0"
+      git remote add origin https://github.com/Krishnamanaidu2526/niko-network.git
+      git branch -M main
+      git push -u origin main
+
+## ▶️ How to Use on a Fresh Kali System
+
+Clone the repo:
+
+    bash
+      git clone https://github.com/Krishnamanaidu2526/niko-network.git
+      cd niko-network
+
+Run the setup script:
+
+    bash
+      ./setup.sh
+
+Start NIKO:
+
+    bash
+       sudo niko
+
+
+## 📝 License
 MIT License – see LICENSE file.
 
+
+# 🚀 NIKO NETWORK — Happy Detecting! 🐱‍💻✨
