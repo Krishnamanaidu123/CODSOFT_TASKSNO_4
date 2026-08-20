@@ -1,7 +1,6 @@
 # CODSOFT_TASKSNO_4
 
-# NIKO NETWORK – 
-# Network Intelligence & Knowledge Observation
+# NIKO NETWORK – Network Intelligence & Knowledge Observation
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue?style=flat-square&logo=python)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
