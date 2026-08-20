@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Single deploy job since we're just deploying
+  # Build and deploy a static landing page for this repository
   deploy:
     environment:
       name: github-pages
@@ -31,13 +31,40 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Prepare site artifact
+        run: |
+          mkdir -p _site
+          cp README.md _site/README.md
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>NIKO NETWORK</title>
+            <style>
+              body { font-family: Arial, sans-serif; margin: 2rem; line-height: 1.6; }
+              h1 { margin-bottom: 0.5rem; }
+              a { color: #0969da; }
+            </style>
+          </head>
+          <body>
+            <h1>NIKO NETWORK</h1>
+            <p>Deployment is active for this repository.</p>
+            <p>
+              View project documentation:
+              <a href="./README.md">README.md</a>
+            </p>
+          </body>
+          </html>
+          HTML
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # Upload entire repository
-          path: '.'
+          # Upload prepared static site
+          path: '_site'
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
