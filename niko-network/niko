@@ -1,5 +1,5 @@
-cat > niko << 'EOF'
 #!/usr/bin/env python3
+
 """
 NIKO - Network Detection and Live Traffic Intelligence Tool
 Production-Ready Network Security Analysis Engine (Headless Mode)
@@ -188,6 +188,7 @@ class NetworkIntelligenceEngine:
         self.packet_count = 0
         self.byte_count = 0
         self.start_time = time.time()
+        self.loop = asyncio.get_event_loop()   # <-- ADD THIS LINE
         self.packet_rate: deque = deque(maxlen=10)
         self.alert_count = 0
         self._running = True
@@ -292,7 +293,7 @@ class NetworkIntelligenceEngine:
             )
             
             # Async enrichment
-            asyncio.create_task(self._enrich_flow(flow_key))
+            asyncio.run_coroutine_threadsafe(self._enrich_flow(flow_key), self.loop)
         else:
             flow = self.flows[flow_key]
             flow.bytes_sent += length
